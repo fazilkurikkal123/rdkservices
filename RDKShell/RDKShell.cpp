@@ -1578,7 +1578,7 @@ namespace WPEFramework {
             bool factoryMacMatched = false;
 #ifdef RFC_ENABLED
             #ifdef RDKSHELL_READ_MAC_ON_STARTUP
-	    Device_Mode_Init();
+	    //Device_Mode_Init();
             factoryMacMatched = checkFactoryMode_wrapper();
 	    #ifdef RDKSHELL_DUAL_FTA_SUPPORT
 	    bool isAssemblyFactoryMode = false;
