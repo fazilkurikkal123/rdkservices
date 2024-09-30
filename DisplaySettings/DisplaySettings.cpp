@@ -85,7 +85,7 @@ using namespace std;
 
 #define API_VERSION_NUMBER_MAJOR 1
 #define API_VERSION_NUMBER_MINOR 4
-#define API_VERSION_NUMBER_PATCH 1
+#define API_VERSION_NUMBER_PATCH 5
 
 static bool isCecEnabled = false;
 static bool isResCacheUpdated = false;
@@ -97,6 +97,7 @@ bool isStbHDRcapabilitiesCache = false;
 static int  hdmiArcPortId = -1;
 static int retryPowerRequestCount = 0;
 static int  hdmiArcVolumeLevel = 0;
+bool audioPortInitActive = false;
 std::vector<int> sad_list;
 #ifdef USE_IARM
 namespace
@@ -243,12 +244,33 @@ namespace WPEFramework {
 
         DisplaySettings::DisplaySettings()
             : PluginHost::JSONRPC()
+	, _engine(Core::ProxyType<RPC::InvokeServerType<1, 0, 4>>::Create())
+	, _communicatorClient(Core::ProxyType<RPC::CommunicatorClient>::Create(Core::NodeId("/tmp/communicator"), Core::ProxyType<Core::IIPCServer>(_engine)))
+	, _controller(nullptr)
+	, _remotStoreObject(nullptr)	
         {
             LOGINFO("ctor");
             DisplaySettings::_instance = this;
             m_client = nullptr;
 
             CreateHandler({ 2 });
+
+	    if (!_communicatorClient.IsValid())
+	    {
+		    LOGWARN("Invalid _communicatorClient \n");
+	    }
+	    else
+	    {
+
+#if ((THUNDER_VERSION == 2) || ((THUNDER_VERSION == 4) && (THUNDER_VERSION_MINOR == 2)))
+		    _engine->Announcements(_communicatorClient->Announcement());
+#endif
+
+		    LOGINFO("Connect the COM-RPC socket\n");
+		    _controller = _communicatorClient->Open<PluginHost::IShell>(_T("org.rdk.SystemMode"), ~0, 3000);
+
+
+	    }
 
             registerMethodLockedApi("getConnectedVideoDisplays", &DisplaySettings::getConnectedVideoDisplays, this);
             registerMethodLockedApi("getConnectedAudioPorts", &DisplaySettings::getConnectedAudioPorts, this);
@@ -355,6 +377,7 @@ namespace WPEFramework {
 	    m_hdmiCecAudioDeviceDetected = false;// Audio device detected through cec ping
             m_hdmiInAudioDevicePowerState = AUDIO_DEVICE_POWER_STATE_UNKNOWN;// Power state of AVR
 	    m_currentArcRoutingState = ARC_STATE_ARC_TERMINATED; // Maintains the ARC state
+	    m_requestSadRetrigger = false;
             m_isPwrMgr2RFCEnabled = false;
 	    m_hdmiInAudioDeviceType = dsAUDIOARCSUPPORT_NONE;// Maintains the Audio device type whether Arc/eArc ocnnected
 	    m_AudioDeviceSADState = AUDIO_DEVICE_SAD_UNKNOWN;// maintains the SAD state
@@ -366,12 +389,36 @@ namespace WPEFramework {
         }
 
         DisplaySettings::~DisplaySettings()
-        {
-            LOGINFO ("dtor");
-	    isResCacheUpdated = false;
-	    isDisplayConnectedCacheUpdated = false;
-            isStbHDRcapabilitiesCache = false;
-        }
+	{
+		if (_controller)
+		{
+			_controller->Release();
+			_controller = nullptr;
+		}
+
+		LOGINFO("Disconnect from the COM-RPC socket\n");
+		// Disconnect from the COM-RPC socket
+		_communicatorClient->Close(RPC::CommunicationTimeOut);
+		if (_communicatorClient.IsValid())
+		{
+			_communicatorClient.Release();
+		}
+
+		if(_engine.IsValid())
+		{
+			_engine.Release();
+		}
+
+		if(_remotStoreObject)
+		{
+			_remotStoreObject->Release();
+		}
+
+		LOGINFO ("dtor");
+		isResCacheUpdated = false;
+		isDisplayConnectedCacheUpdated = false;
+		isStbHDRcapabilitiesCache = false;
+	}
 
         void DisplaySettings::AudioPortsReInitialize()
         {
@@ -555,43 +602,116 @@ namespace WPEFramework {
                 LOGWARN("Current power state %d", m_powerState);
             }
             LOGWARN ("DisplaySettings::Initialize completes line:%d", __LINE__);
+
+	    if (_controller)
+	    {
+		    _remotStoreObject = _controller->QueryInterface<Exchange::ISystemMode>();
+
+		    if(_remotStoreObject)
+		    {
+			    _remotStoreObject->AddRef();
+		    }
+		    else
+		    {
+			    LOGERR("Failed to create SystemMode _controller\n");
+		    }
+	    }
+	    else
+	    {
+		    LOGERR("Failed to create SystemMode Controller\n");
+	    }
+	    ASSERT (nullptr != _remotStoreObject);
+
+
+	    if(_remotStoreObject)
+	    {
+		    const string& callsign = "org.rdk.DisplaySettings";
+		    const string& systemMode = "DEVICE_OPTIMIZE";
+	            _remotStoreObject->ClientActivated(callsign,systemMode);		
+	    }
+            else
+            {
+                    Utils::String::updateSystemModeFile( "DEVICE_OPTIMIZE", "callsign", "org.rdk.DisplaySettings","add") ;
+            }
+
             // On success return empty, to indicate there is no error text.
             return (string());
         }
 
         void DisplaySettings::Deinitialize(PluginHost::IShell* service)
-        {
-	   LOGINFO("Enetering DisplaySettings::Deinitialize");
-	   {
-		std::unique_lock<std::mutex> lock(DisplaySettings::_instance->m_sendMsgMutex);
-		DisplaySettings::_instance->m_sendMsgThreadExit = true;
-                DisplaySettings::_instance->m_sendMsgThreadRun = true;
-                DisplaySettings::_instance->m_sendMsgCV.notify_one();
-	   }
-	   try
-	   {
-		if (m_sendMsgThread.joinable())
-			m_sendMsgThread.join();
-	   }
-	   catch(const std::system_error& e)
-           {
-		LOGERR("system_error exception in thread join %s", e.what());
-	   }
-	   catch(const std::exception& e)
-	   {
-		LOGERR("exception in thread join %s", e.what());
-	   }
+	{
+		LOGINFO("Enetering DisplaySettings::Deinitialize");
 
-            stopCecTimeAndUnsubscribeEvent();
+		//During DisplaySettings plugin  activation the SystemMode may not be added .But it will be added /tmp/SystemMode.txt . If after 5 min SystemMode got activated then SystemMode fill the client map from /tmp/SystemMode.txt. In this case if we deactivate DisplaySettings then _remotStoreObject will be null here . So we try to QueryInterface the ISystemMode one more time 
+		if(_remotStoreObject == nullptr)
+		{
+			if (_controller)
+			{
+				_remotStoreObject = _controller->QueryInterface<Exchange::ISystemMode>();
 
-            DeinitializeIARM();
-            DisplaySettings::_instance = nullptr;
+				if(_remotStoreObject)
+				{
+					_remotStoreObject->AddRef();
+				}
+				else
+				{
+					LOGERR("Failed to create SystemMode _controller\n");
+				}
+			}
+			else
+			{
+				LOGERR("Failed to create SystemMode Controller\n");
+			}
+		}
 
-            ASSERT(service == m_service);
+		ASSERT (nullptr != _remotStoreObject);
 
-            m_service->Release();
-            m_service = nullptr;
-        }
+		if(_remotStoreObject)
+		{
+			const string& callsign = "org.rdk.DisplaySettings";
+			const string& systemMode = "DEVICE_OPTIMIZE";
+			_remotStoreObject->ClientDeactivated(callsign,systemMode);		
+		}
+		else
+		{
+			Utils::String::updateSystemModeFile( "DEVICE_OPTIMIZE", "callsign", "org.rdk.DisplaySettings","delete") ;
+		}
+
+		{
+			std::unique_lock<std::mutex> lock(DisplaySettings::_instance->m_sendMsgMutex);
+			DisplaySettings::_instance->m_sendMsgThreadExit = true;
+			DisplaySettings::_instance->m_sendMsgThreadRun = true;
+			DisplaySettings::_instance->m_sendMsgCV.notify_one();
+		}
+		int count = 0;
+		while(audioPortInitActive && count < 20){
+			sleep(100);
+			count++;
+		}
+		try
+		{
+			if (m_sendMsgThread.joinable())
+				m_sendMsgThread.join();
+		}
+		catch(const std::system_error& e)
+		{
+			LOGERR("system_error exception in thread join %s", e.what());
+		}
+		catch(const std::exception& e)
+		{
+			LOGERR("exception in thread join %s", e.what());
+		}
+
+		stopCecTimeAndUnsubscribeEvent();
+
+		DeinitializeIARM();
+		DisplaySettings::_instance = nullptr;
+
+		ASSERT(service == m_service);
+
+		m_service->Release();
+		m_service = nullptr;
+	}
 
         void DisplaySettings::InitializeIARM()
         {
@@ -866,7 +986,16 @@ namespace WPEFramework {
 
                                 {
                                    DisplaySettings::_instance->m_currentArcRoutingState = ARC_STATE_ARC_TERMINATED;
+				   DisplaySettings::_instance->m_requestSadRetrigger = false;
                                 }
+
+				if (DisplaySettings::_instance->m_AudioDeviceSADState != AUDIO_DEVICE_SAD_CLEARED) {
+					DisplaySettings::_instance->m_AudioDeviceSADState = AUDIO_DEVICE_SAD_CLEARED;
+					LOGINFO("%s: Clearing Audio device SAD\n", __FUNCTION__);
+					sad_list.clear();
+				} else {
+				LOGINFO("SAD already cleared\n");
+	    			}
 
                             }// Release Mutex m_AudioDeviceStatesUpdateMutex
 			}
@@ -1076,6 +1205,7 @@ namespace WPEFramework {
 			m_hdmiInAudioDeviceConnected = false;
 			m_hdmiInAudioDevicePowerState = AUDIO_DEVICE_POWER_STATE_UNKNOWN;
 			m_currentArcRoutingState = ARC_STATE_ARC_TERMINATED;
+			m_requestSadRetrigger = false;
 			m_hdmiInAudioDeviceType = dsAUDIOARCSUPPORT_NONE;
 			m_AudioDeviceSADState = AUDIO_DEVICE_SAD_UNKNOWN;
 			DisplaySettings::_instance->connectedAudioPortUpdated(dsAUDIOPORT_TYPE_HDMI_ARC, false);
@@ -1151,20 +1281,23 @@ namespace WPEFramework {
                 vPort.getSupportedTvResolutions(&tvResolutions);
                 if(!tvResolutions)supportedTvResolutions.emplace_back("none");
                 if(tvResolutions & dsTV_RESOLUTION_480i)supportedTvResolutions.emplace_back("480i");
+                if(tvResolutions & dsTV_RESOLUTION_480i)supportedTvResolutions.emplace_back("480i60");
                 if(tvResolutions & dsTV_RESOLUTION_480p)supportedTvResolutions.emplace_back("480p");
-                if(tvResolutions & dsTV_RESOLUTION_576i)supportedTvResolutions.emplace_back("576i");
-                if(tvResolutions & dsTV_RESOLUTION_576p)supportedTvResolutions.emplace_back("576p");
-		if(tvResolutions & dsTV_RESOLUTION_576p50)supportedTvResolutions.emplace_back("576p50");
-                if(tvResolutions & dsTV_RESOLUTION_720p)supportedTvResolutions.emplace_back("720p");
+                if(tvResolutions & dsTV_RESOLUTION_480p)supportedTvResolutions.emplace_back("480p60");
+                if(tvResolutions & dsTV_RESOLUTION_576i)supportedTvResolutions.emplace_back("576i50");
+                if(tvResolutions & dsTV_RESOLUTION_576p)supportedTvResolutions.emplace_back("576p50");
 		if(tvResolutions & dsTV_RESOLUTION_720p50)supportedTvResolutions.emplace_back("720p50");
-                if(tvResolutions & dsTV_RESOLUTION_1080i)supportedTvResolutions.emplace_back("1080i");
-                if(tvResolutions & dsTV_RESOLUTION_1080p)supportedTvResolutions.emplace_back("1080p");
+                if(tvResolutions & dsTV_RESOLUTION_720p)supportedTvResolutions.emplace_back("720p");
+                if(tvResolutions & dsTV_RESOLUTION_720p)supportedTvResolutions.emplace_back("720p60");
 		if(tvResolutions & dsTV_RESOLUTION_1080p24)supportedTvResolutions.emplace_back("1080p24");
 		if(tvResolutions & dsTV_RESOLUTION_1080p25)supportedTvResolutions.emplace_back("1080p25");
-		if(tvResolutions & dsTV_RESOLUTION_1080i25)supportedTvResolutions.emplace_back("1080i25");
 		if(tvResolutions & dsTV_RESOLUTION_1080p30)supportedTvResolutions.emplace_back("1080p30");
 		if(tvResolutions & dsTV_RESOLUTION_1080i50)supportedTvResolutions.emplace_back("1080i50");
 		if(tvResolutions & dsTV_RESOLUTION_1080p50)supportedTvResolutions.emplace_back("1080p50");
+                if(tvResolutions & dsTV_RESOLUTION_1080i)supportedTvResolutions.emplace_back("1080i");
+                if(tvResolutions & dsTV_RESOLUTION_1080i)supportedTvResolutions.emplace_back("1080i60");
+                if(tvResolutions & dsTV_RESOLUTION_1080p)supportedTvResolutions.emplace_back("1080p");
+                if(tvResolutions & dsTV_RESOLUTION_1080p)supportedTvResolutions.emplace_back("1080p60");
                 if(tvResolutions & dsTV_RESOLUTION_1080p60)supportedTvResolutions.emplace_back("1080p60");
 		if(tvResolutions & dsTV_RESOLUTION_2160p24)supportedTvResolutions.emplace_back("2160p24");
 		if(tvResolutions & dsTV_RESOLUTION_2160p25)supportedTvResolutions.emplace_back("2160p25");
@@ -1240,21 +1373,19 @@ namespace WPEFramework {
             {
                 bool HAL_hasSurround = false;
 
-                device::List<device::VideoOutputPort> vPorts = device::Host::getInstance().getVideoOutputPorts();
-                for (size_t i = 0; i < vPorts.size(); i++) {
-                    device::AudioOutputPort &aPort = vPorts.at(i).getAudioOutputPort();
-                    for (size_t j = 0; j < aPort.getSupportedStereoModes().size(); j++) {
-                        if (audioPort.empty() || Utils::String::stringContains(aPort.getName(), audioPort))
+                device::List<device::AudioOutputPort> aPorts = device::Host::getInstance().getAudioOutputPorts();
+                for (size_t i = 0; i < aPorts.size(); i++) {
+                    if (audioPort.empty() || Utils::String::stringContains(aPorts.at(i).getName(), audioPort))
+                    {
+                        for (size_t j = 0; j < aPorts.at(i).getSupportedStereoModes().size(); j++)
                         {
-                            string audioMode = aPort.getSupportedStereoModes().at(j).getName();
-
+                            string audioMode = aPorts.at(i).getSupportedStereoModes().at(j).getName();
                             // Starging Version 5, "Surround" mode is replaced by "Auto Mode"
                             if (strcasecmp(audioMode.c_str(),"SURROUND") == 0)
                             {
                                 HAL_hasSurround = true;
                                 continue;
                             }
-
                             vectorSet(supportedAudioModes,audioMode);
                         }
                     }
@@ -1291,7 +1422,7 @@ namespace WPEFramework {
                         supportedAudioModes.emplace_back("AUTO (Stereo)");
                     }
                 }
-		else if (audioPort.empty() || Utils::String::stringContains(audioPort, "SPDIF0") || Utils::String::stringContains(audioPort, "HDMI_ARC0"))
+		else if (audioPort.empty() || Utils::String::stringContains(audioPort, "SPDIF0") || Utils::String::stringContains(audioPort, "HDMI_ARC0") || Utils::String::stringContains(audioPort, "HEADPHONE0"))
                 {
                     if (HAL_hasSurround) {
                         supportedAudioModes.emplace_back("SURROUND");
@@ -1733,6 +1864,7 @@ namespace WPEFramework {
 					    if (m_AudioDeviceSADState  != AUDIO_DEVICE_SAD_CLEARED) {
 						LOGINFO("%s: Clearing the SAD since audio mode is changed to PCM\n", __FUNCTION__);
 						m_AudioDeviceSADState  = AUDIO_DEVICE_SAD_CLEARED;
+						m_requestSadRetrigger = false;
 						//clear the SAD list
 						sad_list.clear();
 					    }
@@ -4498,7 +4630,7 @@ namespace WPEFramework {
 							if ( !(m_SADDetectionTimer.isActive()))
 							{ 			    
 								m_SADDetectionTimer.start(SAD_UPDATE_CHECK_TIME_IN_MILLISECONDS);
-							        LOGINFO("%s: Audio device SAD is not received yet, so starting timer for %d seconds", \
+							        LOGINFO("%s: Audio device SAD is not received yet, so starting timer for %d milliseconds", \
 									__FUNCTION__, SAD_UPDATE_CHECK_TIME_IN_MILLISECONDS);
 						        }
 							LOGINFO("%s: Audio Device SAD is pending, Route audio after SAD update\n", __FUNCTION__);
@@ -4591,6 +4723,9 @@ namespace WPEFramework {
 		std::lock_guard<std::mutex> lock(m_SadMutex);
 		device::AudioOutputPort aPort = device::Host::getInstance().getAudioOutputPort("HDMI_ARC0");
 		LOGINFO("m_AudioDeviceSADState = %d, m_arcEarcAudioEnabled = %d, m_hdmiInAudioDeviceConnected = %d\n",m_AudioDeviceSADState, m_arcEarcAudioEnabled, m_hdmiInAudioDeviceConnected);
+		if (m_SADDetectionTimer.isActive()) {
+			m_SADDetectionTimer.stop();
+		}
 		if (m_arcEarcAudioEnabled == false && m_hdmiInAudioDeviceConnected == true){
 			if (m_AudioDeviceSADState == AUDIO_DEVICE_SAD_RECEIVED)
 			{
@@ -4606,16 +4741,27 @@ namespace WPEFramework {
         		   }
                            LOGINFO("SAD is updated m_AudioDeviceSADState = %d\n", m_AudioDeviceSADState);
 			}else{
-				//Still SAD is not received, route audio with out SAD update.
-                        	LOGINFO("Not recieved SAD update after 3sec timeout, proceeding with default SAD\n");
+				if( m_requestSadRetrigger == false )
+                               {
+                                       LOGINFO("Not recieved SAD update after 3sec timeout, retriggering the SAD request and starting the timer for 3 seconds\n");
+                                       m_requestSadRetrigger = true;
+                                       sendMsgToQueue(REQUEST_SHORT_AUDIO_DESCRIPTOR, NULL);
+                                       m_AudioDeviceSADState  = AUDIO_DEVICE_SAD_REQUESTED;
+                                       m_SADDetectionTimer.start(SAD_UPDATE_CHECK_TIME_IN_MILLISECONDS);
+                               }
+                               else
+                               {
+                                       LOGINFO("Not recieved SAD update even after retriggering the SAD request, proceeding with default SAD\n");
+                                       m_requestSadRetrigger = false;
+                               }
 			}
-			LOGINFO("%s: Enable ARC... \n",__FUNCTION__);
-                        aPort.enableARC(dsAUDIOARCSUPPORT_ARC, true);
-                        m_arcEarcAudioEnabled = true;
-		}
+			if (!m_requestSadRetrigger)
+			{
+				LOGINFO("%s: Enable ARC... \n",__FUNCTION__);
+				aPort.enableARC(dsAUDIOARCSUPPORT_ARC, true);
+				m_arcEarcAudioEnabled = true;
 
-		if (m_SADDetectionTimer.isActive()) {
-			m_SADDetectionTimer.stop();
+			}
 		}
 	}
 
@@ -4706,7 +4852,9 @@ namespace WPEFramework {
 
         void DisplaySettings::initAudioPortsWorker(void)
         {
+            audioPortInitActive = true;
             DisplaySettings::_instance->InitAudioPorts();
+            audioPortInitActive = false;
         }
 
         void DisplaySettings::powerEventHandler(const char *owner, IARM_EventId_t eventId, void *data, size_t len)
@@ -4767,6 +4915,7 @@ namespace WPEFramework {
                     	LOGINFO("%s: Cleanup ARC/eARC state\n",__FUNCTION__);
                     	if(DisplaySettings::_instance->m_currentArcRoutingState != ARC_STATE_ARC_TERMINATED)
                             DisplaySettings::_instance->m_currentArcRoutingState = ARC_STATE_ARC_TERMINATED;
+			DisplaySettings::_instance->m_requestSadRetrigger = false;
 		      {
                     	if(DisplaySettings::_instance->m_hdmiInAudioDeviceConnected !=  false) {
                             DisplaySettings::_instance->m_hdmiInAudioDeviceConnected =  false;
@@ -5071,6 +5220,7 @@ void DisplaySettings::sendMsgThread()
 
 	    if (m_AudioDeviceSADState != AUDIO_DEVICE_SAD_CLEARED) {
 		m_AudioDeviceSADState = AUDIO_DEVICE_SAD_CLEARED;
+		m_requestSadRetrigger = false;
 		LOGINFO("%s: Clearing Audio device SAD\n", __FUNCTION__);
 		//clear the SAD list
 		sad_list.clear();
@@ -5084,6 +5234,7 @@ void DisplaySettings::sendMsgThread()
                     value = parameters["status"].String();
                     std::lock_guard<std::mutex> lock(m_AudioDeviceStatesUpdateMutex);
                     m_currentArcRoutingState = ARC_STATE_ARC_TERMINATED;
+		    m_requestSadRetrigger = false;
 	            LOGINFO("Current ARC routing state after update m_currentArcRoutingState=%d\n ", m_currentArcRoutingState);
                     if(!value.compare("success")) {
 		        try 
@@ -5130,6 +5281,7 @@ void DisplaySettings::sendMsgThread()
                     {
 		        std::lock_guard<std::mutex> lock(m_SadMutex);
 			m_AudioDeviceSADState = AUDIO_DEVICE_SAD_RECEIVED;
+			m_requestSadRetrigger = false;
                         device::AudioOutputPort aPort = device::Host::getInstance().getAudioOutputPort("HDMI_ARC0");
 			LOGINFO("Total Short Audio Descriptors received from connected ARC device: %d\n",shortAudioDescriptorList.Length());
 			if(shortAudioDescriptorList.Length() <= 0) {
@@ -5235,6 +5387,7 @@ void DisplaySettings::sendMsgThread()
                             {
 			      // Arc termination happens from HdmiCecSink plugin so just update the state here
                               m_currentArcRoutingState = ARC_STATE_ARC_TERMINATED;
+			      m_requestSadRetrigger = false;
 			      LOGINFO("Updating ARC routing state to ARC terminated\n");
                             }
 
@@ -5286,6 +5439,7 @@ void DisplaySettings::sendMsgThread()
 				    m_hdmiInAudioDeviceConnected = false;	
 		    	    m_hdmiInAudioDevicePowerState = AUDIO_DEVICE_POWER_STATE_UNKNOWN;
                     m_currentArcRoutingState = ARC_STATE_ARC_TERMINATED;
+		    m_requestSadRetrigger = false;
 				    connectedAudioPortUpdated(dsAUDIOPORT_TYPE_HDMI_ARC, false);
 			    }
 		        if (m_AudioDeviceSADState != AUDIO_DEVICE_SAD_CLEARED && m_AudioDeviceSADState != AUDIO_DEVICE_SAD_UNKNOWN) {
@@ -5293,6 +5447,7 @@ void DisplaySettings::sendMsgThread()
 		            //clear the SAD list
 		            sad_list.clear();
 		            m_AudioDeviceSADState = AUDIO_DEVICE_SAD_CLEARED;
+			    m_requestSadRetrigger = false;
 		        } else {
 		            LOGINFO("SAD already cleared\n");
 	            }
@@ -5557,6 +5712,15 @@ void DisplaySettings::sendMsgThread()
                     m_timer.stop();
                 }
             }
+	    
+	    if(!isCecEnabled){
+		try {
+		    isCecEnabled = getHdmiCecSinkCecEnableStatus();
+		}
+		catch (const device::Exception& err){
+		    LOG_DEVICE_EXCEPTION1(string("HDMI_ARC0"));
+		}
+	    }
 
             if(m_subscribed) {
          	//Need to send power on request as this timer might have started based on standby out or boot up scenario
@@ -5829,6 +5993,14 @@ void DisplaySettings::sendMsgThread()
                 sendNotify("connectedVideoDisplaysUpdated", params);
             }
             previousStatus = hdmiHotPlugEvent;
+
+	    //If HDMI hotplug event occurs, DisplaySettings  re-evaluate whether it should be signalling ALLM output of the HDMI port
+	    std::string currentAllmState = "";
+            Utils::String::getSystemModePropertyValue("DEVICE_OPTIMIZE" ,"currentstate" , currentAllmState);
+            if(currentAllmState == "VIDEO" || currentAllmState == "GAME")
+            {
+                    Request(currentAllmState);
+            }
         }
 
         void DisplaySettings::connectedAudioPortUpdated (int iAudioPortType, bool isPortConnected)
@@ -6113,5 +6285,36 @@ void DisplaySettings::sendMsgThread()
 
 	    return mode;
         }
+
+	void DisplaySettings::Request(const string& newState)
+	{
+		vector<string> connectedDisplays;
+		getConnectedVideoDisplaysHelper(connectedDisplays);
+		for (int i = 0; i < (int)connectedDisplays.size(); i++)
+		{
+			try
+			{
+				std::string strVideoPort = connectedDisplays.at(i);;
+				device::VideoOutputPort vPort = device::Host::getInstance().getVideoOutputPort(strVideoPort.c_str());
+				if (isDisplayConnected(strVideoPort))
+				{
+					bool enable = (newState == "GAME") ? true : false;
+					vPort.setAllmEnabled(enable);
+				}
+				else
+				{
+					LOGWARN("failure: %s is not connected!",strVideoPort.c_str());
+				}
+			}
+			catch (const device::Exception& err)
+			{
+				LOG_DEVICE_EXCEPTION0();
+			}
+		}
+		if( 0 == (int)connectedDisplays.size())
+		{
+			LOGWARN("No display connected to device (or)device's powerstate is not ON");
+		}
+	}
     } // namespace Plugin
 } // namespace WPEFramework
